@@ -1,14 +1,16 @@
 // @flow
 
-import { Android, Config, Project, ProjectSettings, Simulator, UrlUtils } from 'xdl';
+import { Android, Config, Project, ProjectSettings, Simulator, UrlUtils, UserSettings } from 'xdl';
 
 import chalk from 'chalk';
 import indent from 'indent-string';
 import qr from 'qrcode-terminal';
 import minimist from 'minimist';
-import log from '../util/log';
-import clearConsole from '../util/clearConsole';
+import readline from 'readline';
+import { Exp } from 'xdl';
 
+import clearConsole from '../util/clearConsole';
+import log from '../util/log';
 import packager from '../util/packager';
 
 Config.validation.reactNativeVersionWarnings = false;
@@ -27,13 +29,23 @@ if (args['reset-cache']) {
   log('Asking packager to reset its cache...');
 }
 
-let isInteractive = false;
 const { stdin } = process;
-if (args.interactive && typeof stdin.setRawMode === 'function') {
+const startWaitingForCommand = () => {
   stdin.setRawMode(true);
   stdin.resume();
   stdin.setEncoding('utf8');
   stdin.on('data', handleKeypress);
+};
+
+const stopWaitingForCommand = () => {
+  stdin.removeListener('data', handleKeypress);
+  stdin.setRawMode(false);
+  stdin.resume();
+};
+
+let isInteractive = false;
+if (args.interactive && typeof stdin.setRawMode === 'function') {
+  startWaitingForCommand();
   isInteractive = true;
 }
 
@@ -49,16 +61,27 @@ async function printServerInfo() {
   const settings = await ProjectSettings.readPackagerInfoAsync(process.cwd());
   // who knows why qrcode-terminal takes a callback instead of just returning a string
   const address = await UrlUtils.constructManifestUrlAsync(process.cwd());
+  let emulatorHelp;
+  if (process.platform === 'darwin') {
+    emulatorHelp = `Press ${chalk.bold('a')} (Android) or ${chalk.bold('i')} (iOS) to start an emulator.`;
+  } else {
+    emulatorHelp = `Press ${chalk.bold('a')} to start an Android emulator.`;
+  }
   qr.generate(address, qrCode => {
-    log(
-      `To view your app with live reloading, point the Expo app to this QR code.
-You'll find the QR scanner on the Projects tab of the app.
-
+    log(`
 ${indent(qrCode, 2)}
 
-Or enter this address in the Expo app's search bar:
+Your app is now running at URL: ${chalk.underline(chalk.cyan(address))}
 
-  ${chalk.underline(chalk.cyan(address))}
+${chalk.bold('View your app with live reloading:')}
+
+  ${chalk.underline('Android device:')}
+    -> Point the Expo app to the QR code above.
+       (You'll find the QR scanner on the Projects tab of the app.)
+  ${chalk.underline('iOS device:')}
+    -> Press ${chalk.bold('s')} to email/text the app URL to your phone.
+  ${chalk.underline('Emulator:')}
+    -> ${emulatorHelp}
 
 Your phone will need to be on the same local network as this computer.
 For links to install the Expo app, please visit ${chalk.underline(chalk.cyan('https://expo.io'))}.
@@ -75,12 +98,13 @@ function printUsage() {
   }
   const { dim, bold } = chalk;
   const devMode = dev ? 'development' : 'production';
-  const iosInfo = process.platform === 'win32'
-    ? dim('.')
-    : `${dim(`, or`)} i ${dim(`to open iOS emulator.`)}`;
+  const iosInfo = process.platform === 'darwin'
+    ? `${dim(`, or`)} i ${dim(`to open iOS emulator.`)}`
+    : dim('.');
   log(
     `
  ${dim(`\u203A Press`)} a ${dim(`to open Android device or emulator`)}${iosInfo}
+ ${dim(`\u203A Press`)} s ${dim(`to send the app URL to your phone number or email address`)}
  ${dim(`\u203A Press`)} q ${dim(`to display QR code.`)}
  ${dim(`\u203A Press`)} r ${dim(`to restart packager, or`)} R ${dim(`to restart packager and clear cache.`)}
  ${dim(`\u203A Press`)} d ${dim(`to toggle development mode. (current mode: ${bold(devMode)}${chalk.reset.dim(')')}`)}
@@ -118,6 +142,61 @@ async function handleKeypress(key) {
         log(chalk.red(msg));
       }
       printUsage();
+      return;
+    }
+    case 's': {
+      stopWaitingForCommand();
+      const lanAddress = await UrlUtils.constructManifestUrlAsync(process.cwd(), {
+        hostType: 'lan',
+      });
+      const defaultRecipient = await UserSettings.getAsync('sendTo', null);
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      const handleKeypress = (chr, key) => {
+        if (key && key.name === 'escape') {
+          cleanup();
+          cancel();
+        }
+      };
+      const cleanup = () => {
+        rl.close();
+        process.stdin.removeListener('keypress', handleKeypress);
+        startWaitingForCommand();
+      };
+      const cancel = () => {
+        clearConsole();
+        printUsage();
+      };
+      clearConsole();
+      process.stdin.addListener('keypress', handleKeypress);
+      log('Please enter your phone number or email address (press ESC to cancel) ');
+      rl.question(defaultRecipient ? `[default: ${defaultRecipient}]> ` : '> ', async sendTo => {
+        cleanup();
+        if (!sendTo && defaultRecipient) {
+          sendTo = defaultRecipient;
+        }
+        sendTo = sendTo && sendTo.trim();
+        if (!sendTo) {
+          cancel();
+          return;
+        }
+        log.withTimestamp(`Sending ${lanAddress} to ${sendTo}...`);
+
+        let sent = false;
+        try {
+          await Exp.sendAsync(sendTo, lanAddress, true);
+          log.withTimestamp(`Sent link successfully.`);
+          sent = true;
+        } catch (err) {
+          log.withTimestamp(`Could not send link. ${err}`);
+        }
+        printUsage();
+        if (sent) {
+          await UserSettings.setAsync('sendTo', sendTo);
+        }
+      });
       return;
     }
     case 'q':

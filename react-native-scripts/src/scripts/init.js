@@ -5,47 +5,73 @@ import fse from 'fs-extra';
 import path from 'path';
 import pathExists from 'path-exists';
 import spawn from 'cross-spawn';
+import minimist from 'minimist';
 import log from '../util/log';
 import install from '../util/install';
+import { hasYarn } from '../util/pm';
 
 // UPDATE DEPENDENCY VERSIONS HERE
 const DEFAULT_DEPENDENCIES = {
-  expo: '^25.0.0',
-  react: '16.2.0',
-  'react-native': '0.52.0',
+  expo: '^27.0.1',
+  react: '16.3.1',
+  'react-native': '~0.55.2',
+};
+
+const WEB_DEFAULT_DEPENDENCIES = {
+  'expo-web': '^0.0.12',
+  'react-dom': '16.0.0',
+  'react-native-web': '^0.4.0',
+  webpack: '^3.11.0',
+  'webpack-dev-server': '2.9.4',
 };
 
 // TODO figure out how this interacts with ejection
 const DEFAULT_DEV_DEPENDENCIES = {
-  'jest-expo': '25.0.0',
-  'react-test-renderer': '16.2.0',
+  'jest-expo': '~27.0.0',
+  'react-test-renderer': '16.3.1',
 };
+
+const WEB_DEFAULT_DEV_DEPENDENCIES = {
+  'react-native-scripts': 'latest',
+  'babel-loader': '^7.1.2',
+  'babel-plugin-expo-web': '^0.0.5',
+  'babel-plugin-react-native-web': '^0.4.0',
+  'babel-plugin-transform-decorators-legacy': '^1.3.4',
+  'babel-plugin-transform-imports': '^1.4.1',
+  'babel-plugin-transform-runtime': '^6.23.0',
+  'file-loader': '^1.1.7',
+  'css-loader': '^0.28.7',
+  'style-loader': '^0.19.0',
+};
+
+const arg = minimist(process.argv.slice(2), {
+  boolean: ['with-web-support'],
+});
 
 module.exports = async (appPath: string, appName: string, verbose: boolean, cwd: string = '') => {
   const ownPackageName: string = require('../../package.json').name;
   const ownPath: string = path.join(appPath, 'node_modules', ownPackageName);
-  const useYarn: boolean = await pathExists(path.join(appPath, 'yarn.lock'));
+  const useYarn: boolean = hasYarn(appPath);
   const npmOrYarn = useYarn ? 'yarn' : 'npm';
 
-  // FIXME(perry) remove when npm 5 is supported
   if (!useYarn) {
     let npmVersion = spawn.sync('npm', ['--version']).stdout.toString().trim();
+    let npmVersionParts = npmVersion.split('.');
+    let majorVersion = parseInt(npmVersion[0], 10);
+    let minorVersion = parseInt(npmVersion[1], 10);
+    let patchVersion = parseInt(npmVersion[2], 10);
 
-    if (npmVersion.match(/\d+/)[0] === '5') {
+    if (majorVersion === 5 && minorVersion < 7) {
       console.log(
         chalk.yellow(
           `
 *******************************************************************************
-ERROR: npm 5 is not supported yet
+ERROR: npm >= 5.0.0 and < 5.7.0 are not supported
 *******************************************************************************
 
-It looks like you're using npm 5 which was recently released.
+It looks like you're using a version of npm that is buggy with this tool.
 
-Create React Native App doesn't work with npm 5 yet, unfortunately. We
-recommend using npm 4 or yarn until some bugs are resolved.
-
-You can follow the known issues with npm 5 at:
-https://github.com/npm/npm/issues/16991
+We recommend using npm >= 5.7.0 or yarn.
 
 *******************************************************************************
  `
@@ -70,8 +96,17 @@ https://github.com/npm/npm/issues/16991
     eject: 'react-native-scripts eject',
     android: 'react-native-scripts android',
     ios: 'react-native-scripts ios',
-    test: 'node node_modules/jest/bin/jest.js',
+    test: 'jest',
   };
+
+  const withWebSupport = arg['with-web-support'];
+  if (withWebSupport) {
+    appPackage.main = './node_modules/react-native-scripts/build/bin/crna-entry-web.js';
+    Object.assign(appPackage.scripts, {
+      web: 'webpack-dev-server -d --config ./webpack.config.js  --inline --hot --colors --content-base public/ --history-api-fallback',
+      build: 'NODE_ENV=production webpack -p --config ./webpack.config.js',
+    });
+  }
 
   appPackage.jest = {
     preset: 'jest-expo',
@@ -90,11 +125,19 @@ https://github.com/npm/npm/issues/16991
   Object.assign(appPackage.dependencies, DEFAULT_DEPENDENCIES);
   Object.assign(appPackage.devDependencies, DEFAULT_DEV_DEPENDENCIES);
 
+  if (withWebSupport) {
+    Object.assign(appPackage.dependencies, WEB_DEFAULT_DEPENDENCIES);
+    Object.assign(appPackage.devDependencies, WEB_DEFAULT_DEV_DEPENDENCIES);
+  }
+
   // Write the new appPackage after copying so that we can include any existing
   await fse.writeFile(appPackagePath, JSON.stringify(appPackage, null, 2));
 
   // Copy the files for the user
-  await fse.copy(path.join(ownPath, 'template'), appPath);
+  await fse.copy(
+    path.join(ownPath, arg['with-web-support'] ? 'template-with-web' : 'template'),
+    appPath
+  );
 
   // Rename gitignore after the fact to prevent npm from renaming it to .npmignore
   try {
@@ -127,7 +170,6 @@ https://github.com/npm/npm/issues/16991
 
   log(
     `
-
 Success! Created ${appName} at ${appPath}
 Inside that directory, you can run several commands:
 
@@ -143,13 +185,14 @@ Inside that directory, you can run several commands:
     (Requires Android build tools)
     Starts the development server and loads your app on a connected Android
     device or emulator.
-
+  ${withWebSupport ? webLogMessage(npmOrYarn) : '\n'}
   ${chalk.cyan(npmOrYarn + ' test')}
     Starts the test runner.
 
   ${chalk.cyan(npmOrYarn + ' run eject')}
     Removes this tool and copies build dependencies, configuration files
     and scripts into the app directory. If you do this, you can’t go back!
+
 
 We suggest that you begin by typing:
 
@@ -167,3 +210,10 @@ ${chalk.yellow('You had a `README.md` file, we renamed it to `README.old.md`')}`
   log();
   log('Happy hacking!');
 };
+
+function webLogMessage(npmOrYarn) {
+  return `
+  ${chalk.cyan(npmOrYarn + ' web')}
+    Starts the Webpack server to serve the web version of the app.
+  `;
+}
